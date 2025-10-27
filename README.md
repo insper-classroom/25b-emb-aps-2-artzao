@@ -1,11 +1,17 @@
-Jogo: Megabonk.
+# Controle para Jogo - Megabonk
 
-Ideia do controle: ser um controle funcional e específico para jogar Megabonk, parecido com controles da atualidade como o Dualsense, mas completamente personalizado para o jogo.
+- Ideia do controle: ser um controle funcional e específico para jogar Megabonk, parecido com controles da atualidade como o Dualsense, mas completamente personalizado para o jogo.
 
-Inputs e Outputs (sensores e atuadores): 2 analógicos e 4 botões.
+## Inputs e Outputs (sensores e atuadores): 2 analógicos e 4 botões
 
-Protocolo utilizado: UART
+## Protocolo utilizado: UART
 
-Diagrama de blocos explicativo do firmware:
+## Diagrama de blocos explicativo do firmware:
 
-Imagens do controle (proposta e real), e links para arquivos ou outras coisas úteis:
+## Imagens do controle
+
+![Protótipo Controle](img/Untitled.png)
+
+- Protótipo atual
+
+## Links úteis
