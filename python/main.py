@@ -13,7 +13,17 @@ from time import sleep
 pyautogui.FAILSAFE = False
 
 # (opcional) um pequeno intervalo entre ações ajuda a suavizar
+BUTTON_MAP = {
+    2: 'w',
+    3: 'a',
+    4: 's',
+    5: 'd',
+    # Exemplos extras:
+    # 6: 'space',
+    # 7: 'esc',
+}
 
+button_states = {}  # {button_id: 0/1}
 
 def move_mouse(axis, value):
     """Move o mouse de acordo com o eixo e valor recebidos."""
@@ -22,6 +32,37 @@ def move_mouse(axis, value):
     elif axis == 1:
         pyautogui.moveRel(0, value)
 
+
+def handle_button(button_id, value):
+    """
+    Trata botões:
+      value = 1 -> keyDown
+      value = 0 -> keyUp
+    Evita eventos duplicados comparando com o último estado conhecido.
+    """
+    if button_id not in BUTTON_MAP:
+        return  # botão sem mapeamento → ignora
+    key = BUTTON_MAP[button_id]
+
+    prev = button_states.get(button_id, None)
+    # Só envia evento se mudou o estado (debounce lógico)
+    if prev != value:
+        if value == 1:
+            pyautogui.keyDown(key)
+        else:
+            pyautogui.keyUp(key)
+        button_states[button_id] = value
+
+def handle_input(axis, value):
+    """
+    Direciona o pacote para mouse (axis 0/1) ou botões (axis >=2).
+    Para botões, espera-se value em {0,1}.
+    """
+    if axis in (0, 1):
+        move_mouse(axis, value)
+    else:
+        # Trata como botão
+        handle_button(axis, 1 if value != 0 else 0)
 
 def controle(ser):
     """
@@ -40,7 +81,7 @@ def controle(ser):
                 continue
             print(data)
             axis, value = parse_data(data)
-            move_mouse(axis, value)
+            handle_input(axis, value)
 
 
 def serial_ports():
@@ -89,14 +130,14 @@ def conectar_porta(port_name, root, botao_conectar, status_label, mudar_cor_circ
         messagebox.showwarning("Aviso", "Selecione uma porta serial antes de conectar.")
         return
 
+    ser = None
     try:
         ser = serial.Serial(port_name, 115200, timeout=1)
         status_label.config(text=f"Conectado em {port_name}", foreground="green")
         mudar_cor_circulo("green")
-        botao_conectar.config(text="Conectado")  # Update button text to indicate connection
+        botao_conectar.config(text="Conectado")
         root.update()
 
-        # Inicia o loop de leitura (bloqueante).
         controle(ser)
 
     except KeyboardInterrupt:
@@ -105,7 +146,11 @@ def conectar_porta(port_name, root, botao_conectar, status_label, mudar_cor_circ
         messagebox.showerror("Erro de Conexão", f"Não foi possível conectar em {port_name}.\nErro: {e}")
         mudar_cor_circulo("red")
     finally:
-        ser.close()
+        try:
+            if ser and ser.is_open:
+                ser.close()
+        except Exception:
+            pass
         status_label.config(text="Conexão encerrada.", foreground="red")
         mudar_cor_circulo("red")
 
@@ -116,7 +161,7 @@ def criar_janela():
     root.geometry("400x250")
     root.resizable(False, False)
 
-    # Dark mode color settings
+    # Dark mode
     dark_bg = "#2e2e2e"
     dark_fg = "#ffffff"
     accent_color = "#007acc"
@@ -132,8 +177,6 @@ def criar_janela():
     style.configure("Accent.TButton", font=("Segoe UI", 12, "bold"),
                     foreground=dark_fg, background=accent_color, padding=6)
     style.map("Accent.TButton", background=[("active", "#005f9e")])
-
-    # Updated combobox styling to match the dark GUI color
     style.configure("TCombobox",
                     fieldbackground=dark_bg,
                     background=dark_bg,
@@ -141,7 +184,6 @@ def criar_janela():
                     padding=4)
     style.map("TCombobox", fieldbackground=[("readonly", dark_bg)])
 
-    # Main content frame (upper portion)
     frame_principal = ttk.Frame(root, padding="20")
     frame_principal.pack(expand=True, fill="both")
 
@@ -150,24 +192,26 @@ def criar_janela():
 
     porta_var = tk.StringVar(value="")
 
+    status_label = None  # declarado antes para fechar sobre ele na lambda
+
+    def start_connect():
+        conectar_porta(porta_var.get(), root, botao_conectar, status_label, mudar_cor_circulo)
+
     botao_conectar = ttk.Button(
         frame_principal,
         text="Conectar e Iniciar Leitura",
         style="Accent.TButton",
-        command=lambda: conectar_porta(porta_var.get(), root, botao_conectar, status_label, mudar_cor_circulo)
+        command=start_connect
     )
     botao_conectar.pack(pady=10)
 
-    # Create footer frame with grid layout to host status label, port dropdown, and status circle
     footer_frame = tk.Frame(root, bg=dark_bg)
     footer_frame.pack(side="bottom", fill="x", padx=10, pady=(10, 0))
 
-    # Left: Status label
     status_label = tk.Label(footer_frame, text="Aguardando seleção de porta...", font=("Segoe UI", 11),
                             bg=dark_bg, fg=dark_fg)
     status_label.grid(row=0, column=0, sticky="w")
 
-    # Center: Port selection dropdown
     portas_disponiveis = serial_ports()
     if portas_disponiveis:
         porta_var.set(portas_disponiveis[0])
@@ -175,7 +219,6 @@ def criar_janela():
                                  values=portas_disponiveis, state="readonly", width=10)
     port_dropdown.grid(row=0, column=1, padx=10)
 
-    # Right: Status circle (canvas)
     circle_canvas = tk.Canvas(footer_frame, width=20, height=20, highlightthickness=0, bg=dark_bg)
     circle_item = circle_canvas.create_oval(2, 2, 18, 18, fill="red", outline="")
     circle_canvas.grid(row=0, column=2, sticky="e")
