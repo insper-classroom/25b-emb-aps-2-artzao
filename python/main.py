@@ -13,17 +13,18 @@ from time import sleep
 pyautogui.FAILSAFE = False
 
 # (opcional) um pequeno intervalo entre ações ajuda a suavizar
-BUTTON_MAP = {
-    2: 'w',
-    3: 'a',
-    4: 's',
-    5: 'd',
-    # Exemplos extras:
-    # 6: 'space',
-    # 7: 'esc',
-}
 
-button_states = {}  # {button_id: 0/1}
+# === ADDED/CHANGED ===
+# Button protocol constants to match the firmware
+PKT_AXIS_HDR   = 0xFF
+PKT_BUTTON_HDR = 0xFE
+
+KEY_LMB   = 1
+KEY_RMB   = 2
+KEY_SHIFT = 3
+KEY_CTRL  = 4
+
+
 
 def move_mouse(axis, value):
     """Move o mouse de acordo com o eixo e valor recebidos."""
@@ -32,56 +33,81 @@ def move_mouse(axis, value):
     elif axis == 1:
         pyautogui.moveRel(0, value)
 
+# === ADDED/CHANGED ===
+def handle_button(key_type: int, press: bool):
+    """Converte o pacote de botão em uma ação pyautogui."""
+    try:
+        if key_type == KEY_LMB:
+            if press:
+                pyautogui.mouseDown(button='left')
+            else:
+                pyautogui.mouseUp(button='left')
+        elif key_type == KEY_RMB:
+            if press:
+                pyautogui.mouseDown(button='right')
+            else:
+                pyautogui.mouseUp(button='right')
+        elif key_type == KEY_SHIFT:
+            if press:
+                pyautogui.keyDown('shift')
+            else:
+                pyautogui.keyUp('shift')
+        elif key_type == KEY_CTRL:
+            if press:
+                pyautogui.keyDown('ctrl')
+            else:
+                pyautogui.keyUp('ctrl')
+        # else: desconhecido → ignore
+    except Exception as e:
+        # Evita quebrar o loop caso o sistema recuse eventos (ex: tela protegida)
+        print(f"[WARN] Falha em aplicar ação de botão: {e}", file=sys.stderr)
 
-def handle_button(button_id, value):
-    """
-    Trata botões:
-      value = 1 -> keyDown
-      value = 0 -> keyUp
-    Evita eventos duplicados comparando com o último estado conhecido.
-    """
-    if button_id not in BUTTON_MAP:
-        return  # botão sem mapeamento → ignora
-    key = BUTTON_MAP[button_id]
+def parse_axis_data(data):
+    """Interpreta os dados recebidos do buffer (axis + valor)."""
+    axis = data[0]
+    value = int.from_bytes(data[1:3], byteorder='little', signed=True)
+    return axis, value
 
-    prev = button_states.get(button_id, None)
-    # Só envia evento se mudou o estado (debounce lógico)
-    if prev != value:
-        if value == 1:
-            pyautogui.keyDown(key)
-        else:
-            pyautogui.keyUp(key)
-        button_states[button_id] = value
-
-def handle_input(axis, value):
-    """
-    Direciona o pacote para mouse (axis 0/1) ou botões (axis >=2).
-    Para botões, espera-se value em {0,1}.
-    """
-    if axis in (0, 1):
-        move_mouse(axis, value)
-    else:
-        # Trata como botão
-        handle_button(axis, 1 if value != 0 else 0)
 
 def controle(ser):
     """
-    Loop principal que lê bytes da porta serial em loop infinito.
-    Aguarda o byte 0xFF e então lê 3 bytes: axis (1 byte) + valor (2 bytes).
+    Loop principal que lê bytes da porta serial:
+      - 0xFF → pacote de eixo (axis + valor int16)
+      - 0xFE → pacote de botão (key_type + flags + checksum)
     """
     while True:
-        # Aguardar byte de sincronização
         sync_byte = ser.read(size=1)
         if not sync_byte:
             continue
-        if sync_byte[0] == 0xFF:
-            # Ler 3 bytes (axis + valor(2b))
+
+        hdr = sync_byte[0]
+
+        if hdr == PKT_AXIS_HDR:
+            # Ler 3 bytes (axis + valor(2b, little-endian, signed))
             data = ser.read(size=3)
             if len(data) < 3:
                 continue
-            print(data)
-            axis, value = parse_data(data)
-            handle_input(axis, value)
+            axis, value = parse_axis_data(data)
+            move_mouse(axis, value)
+
+        # === ADDED/CHANGED ===
+        elif hdr == PKT_BUTTON_HDR:
+            # Ler 3 bytes (key_type, flags, checksum)
+            data = ser.read(size=3)
+            if len(data) < 3:
+                continue
+            key_type, flags, checksum = data[0], data[1], data[2]
+            # Verifica checksum simples
+            if ((key_type + flags) & 0xFF) != checksum:
+                # checksum ruim → descarta
+                print(f"[WARN] Checksum inválido: key={key_type} flags={flags} csum={checksum}", file=sys.stderr)
+                continue
+            press = bool(flags & 0x01)
+            handle_button(key_type, press)
+
+        else:
+            # Byte desconhecido → continue procurando header
+            continue
 
 
 def serial_ports():
@@ -123,7 +149,6 @@ def parse_data(data):
     value = int.from_bytes(data[1:3], byteorder='little', signed=True)
     return axis, value
 
-
 def conectar_porta(port_name, root, botao_conectar, status_label, mudar_cor_circulo):
     """Abre a conexão com a porta selecionada e inicia o loop de leitura."""
     if not port_name:
@@ -138,6 +163,7 @@ def conectar_porta(port_name, root, botao_conectar, status_label, mudar_cor_circ
         botao_conectar.config(text="Conectado")
         root.update()
 
+        # Inicia o loop de leitura (bloqueante).
         controle(ser)
 
     except KeyboardInterrupt:
@@ -146,13 +172,14 @@ def conectar_porta(port_name, root, botao_conectar, status_label, mudar_cor_circ
         messagebox.showerror("Erro de Conexão", f"Não foi possível conectar em {port_name}.\nErro: {e}")
         mudar_cor_circulo("red")
     finally:
-        try:
-            if ser and ser.is_open:
+        if ser is not None:
+            try:
                 ser.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
         status_label.config(text="Conexão encerrada.", foreground="red")
         mudar_cor_circulo("red")
+
 
 
 def criar_janela():
@@ -161,7 +188,7 @@ def criar_janela():
     root.geometry("400x250")
     root.resizable(False, False)
 
-    # Dark mode
+    # Dark mode color settings
     dark_bg = "#2e2e2e"
     dark_fg = "#ffffff"
     accent_color = "#007acc"
@@ -177,6 +204,7 @@ def criar_janela():
     style.configure("Accent.TButton", font=("Segoe UI", 12, "bold"),
                     foreground=dark_fg, background=accent_color, padding=6)
     style.map("Accent.TButton", background=[("active", "#005f9e")])
+
     style.configure("TCombobox",
                     fieldbackground=dark_bg,
                     background=dark_bg,
@@ -192,16 +220,17 @@ def criar_janela():
 
     porta_var = tk.StringVar(value="")
 
-    status_label = None  # declarado antes para fechar sobre ele na lambda
+    status_label = tk.Label(root, text="Aguardando seleção de porta...", font=("Segoe UI", 11),
+                            bg=dark_bg, fg=dark_fg)
 
-    def start_connect():
-        conectar_porta(porta_var.get(), root, botao_conectar, status_label, mudar_cor_circulo)
+    def mudar_cor_circulo(cor):
+        circle_canvas.itemconfig(circle_item, fill=cor)
 
     botao_conectar = ttk.Button(
         frame_principal,
         text="Conectar e Iniciar Leitura",
         style="Accent.TButton",
-        command=start_connect
+        command=lambda: conectar_porta(porta_var.get(), root, botao_conectar, status_label, mudar_cor_circulo)
     )
     botao_conectar.pack(pady=10)
 
@@ -224,9 +253,6 @@ def criar_janela():
     circle_canvas.grid(row=0, column=2, sticky="e")
 
     footer_frame.columnconfigure(1, weight=1)
-
-    def mudar_cor_circulo(cor):
-        circle_canvas.itemconfig(circle_item, fill=cor)
 
     root.mainloop()
 

@@ -19,9 +19,9 @@ target_include_directories(pico_emb PRIVATE
 target_link_libraries(pico_emb PRIVATE
     pico_async_context_freertos
     FreeRTOS-Kernel-Heap4
-    pico_stdlib
     hardware_i2c
-    ssd1306_lib
+    #ssd1306_lib
+    pico_stdlib
     hardware_adc
     )
 # Set the nunber of cores to 1.
