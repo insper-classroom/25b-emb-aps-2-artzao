@@ -24,6 +24,11 @@ target_link_libraries(pico_emb PRIVATE
     pico_stdlib
     hardware_adc
     )
+
+# Para usar USB-CDC em vez de UART hardware, descomente as linhas abaixo:
+# pico_enable_stdio_usb(main 1)
+# pico_enable_stdio_uart(main 0)
+# target_compile_definitions(pico_emb PRIVATE USE_USB_CDC=1)
 # Set the nunber of cores to 1.
 # This defaults to 2 in FreeRTOSConfig_examples_common.h if not defined in here
 target_compile_definitions(pico_emb PRIVATE
