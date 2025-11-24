@@ -36,6 +36,16 @@
  * - UART0: Padrão em GP0/GP1, suporta até 921600 baud (usando 115200)
  * - FreeRTOS: Requer configuração adequada de tick timer e CPU clock em FreeRTOSConfig.h
  * 
+ * ARQUITETURA DE EVENTOS (OTIMIZADA):
+ * - Duas filas separadas: INPUT (joystick + botões) e IMU (mouse/câmera)
+ * - Priorização: eventos de INPUT têm prioridade máxima sobre IMU
+ * - Timeout em eventos críticos: joystick e botões aguardam até 10ms antes de desistir
+ * - IMU pode perder eventos se fila cheia (não é crítico)
+ * 
+ * DEBUG:
+ * - Para ativar logs detalhados, defina DEBUG no compilador (ex: -DDEBUG)
+ * - Em modo normal (sem DEBUG), apenas erros críticos são impressos
+ * 
  * PROTOCOLO DE COMUNICAÇÃO (4 bytes por mensagem):
  * 
  * 1. TECLA (Header 0x54 'T'):
@@ -111,8 +121,18 @@
 #define FATOR_PRIORIZA_HORIZONTAL 1.2f   // Se abs_x > abs_y * este_fator → prioriza horizontal
 #define BUTTON_DELAY_MS    50      // Intervalo de leitura dos botões (ms)
 #define BUTTON_DEBOUNCE_MS 100     // Tempo de debounce dos botões (ms)
-#define IMU_DELAY_MS       20      // Intervalo de leitura do IMU (ms)
-#define QUEUE_SIZE         10      // Tamanho da fila de eventos
+#define IMU_DELAY_MS       30      // Intervalo de leitura do IMU (ms) - reduzido para aliviar fila
+#define QUEUE_SIZE_INPUT   32      // Tamanho da fila de eventos de INPUT (joystick + botões) - prioridade máxima
+#define QUEUE_SIZE_IMU     16      // Tamanho da fila de eventos de IMU (mouse/câmera) - prioridade menor
+
+// Prioridades das tasks FreeRTOS (maior número = maior prioridade)
+#define PRIORIDADE_UART    3       // Máxima prioridade: task de envio UART (drena as filas)
+#define PRIORIDADE_INPUT   2       // Alta prioridade: joystick e botões (controles primários)
+#define PRIORIDADE_IMU     1       // Baixa prioridade: IMU (câmera, pode perder eventos)
+
+// Timeout para envio de eventos críticos (joystick e botões)
+// Se a fila estiver cheia, aguarda até 10ms antes de desistir
+#define TIMEOUT_QUEUE_CRITICO pdMS_TO_TICKS(10)  // 10ms de timeout para eventos críticos
 
 // ========================= DEFINES - PROTOCOLO =========================
 
@@ -189,7 +209,9 @@ typedef struct {
 
 // ========================= VARIÁVEIS GLOBAIS =========================
 
-QueueHandle_t xQueueEventos;  // Fila para eventos (joystick, botões, IMU)
+// Filas separadas para priorizar eventos de controle sobre IMU
+QueueHandle_t xQueueEventosInput;  // Fila para eventos de INPUT (joystick + botões) - PRIORIDADE MÁXIMA
+QueueHandle_t xQueueEventosIMU;   // Fila para eventos de IMU (mouse/câmera) - PRIORIDADE MENOR
 
 // ========================= FUNÇÕES AUXILIARES =========================
 
@@ -328,6 +350,7 @@ static void ler_joystick(int *delta_x, int *delta_y) {
 
 /**
  * Envia evento de PRESS (pressionar tecla) para uma tecla específica
+ * CRÍTICO: Verifica retorno e reporta erro se fila estiver cheia
  */
 static void enviar_press_tecla(uint8_t tecla) {
     evento_t evento = {
@@ -336,12 +359,20 @@ static void enviar_press_tecla(uint8_t tecla) {
         .valor = 1,  // PRESS
         .valor2 = 0
     };
-    xQueueSend(xQueueEventos, &evento, 0);
+    // Usa timeout para garantir que eventos críticos não sejam perdidos
+    BaseType_t ok = xQueueSend(xQueueEventosInput, &evento, TIMEOUT_QUEUE_CRITICO);
+    if (ok != pdTRUE) {
+        // ERRO CRÍTICO: evento de joystick perdido (fila cheia ou timeout)
+        printf("[ERRO CRÍTICO] Fila cheia! PRESS tecla 0x%02X ('%c') PERDIDA\n", tecla, tecla);
+    }
+    #ifdef DEBUG
     printf("[JOY] PRESS: %c\n", tecla);
+    #endif
 }
 
 /**
  * Envia evento de RELEASE (soltar tecla) para uma tecla específica
+ * CRÍTICO: Verifica retorno e reporta erro se fila estiver cheia
  */
 static void enviar_release_tecla(uint8_t tecla) {
     evento_t evento = {
@@ -350,8 +381,15 @@ static void enviar_release_tecla(uint8_t tecla) {
         .valor = 0,  // RELEASE
         .valor2 = 0
     };
-    xQueueSend(xQueueEventos, &evento, 0);
+    // Usa timeout para garantir que eventos críticos não sejam perdidos
+    BaseType_t ok = xQueueSend(xQueueEventosInput, &evento, TIMEOUT_QUEUE_CRITICO);
+    if (ok != pdTRUE) {
+        // ERRO CRÍTICO: evento de joystick perdido (fila cheia ou timeout)
+        printf("[ERRO CRÍTICO] Fila cheia! RELEASE tecla 0x%02X ('%c') PERDIDA\n", tecla, tecla);
+    }
+    #ifdef DEBUG
     printf("[JOY] RELEASE: %c\n", tecla);
+    #endif
 }
 
 /**
@@ -511,12 +549,6 @@ void task_joystick(void *p) {
         int delta_x, delta_y;
         ler_joystick(&delta_x, &delta_y);
         
-        // Lê valores brutos para debug
-        adc_select_input(ADC_CHANNEL_X);
-        uint16_t raw_x = adc_read();
-        adc_select_input(ADC_CHANNEL_Y);
-        uint16_t raw_y = adc_read();
-        
         // 2) Calcula direção nova baseada nos deltas, usando direcao_atual para histerese
         joy_dir_t direcao_nova = calcular_direcao(delta_x, delta_y, direcao_atual);
         
@@ -561,6 +593,7 @@ void task_joystick(void *p) {
         atualiza_tecla_virtual(TECLA_S, &s_pressionada, s_desejada);
         atualiza_tecla_virtual(TECLA_D, &d_pressionada, d_desejada);
         
+        #ifdef DEBUG
         // Debug detalhado (a cada 20 leituras para não poluir)
         static int debug_counter = 0;
         if (++debug_counter >= 20) {
@@ -586,6 +619,7 @@ void task_joystick(void *p) {
                    delta_x, delta_y, abs_x, abs_y, th_desativa, th_ativa);
             debug_ruido_counter = 0;
         }
+        #endif
         
         vTaskDelay(pdMS_TO_TICKS(JOYSTICK_DELAY_MS));
     }
@@ -628,6 +662,7 @@ void task_botoes(void *p) {
     bool estado_anterior[4] = {true, true, true, true};
     uint32_t ultimo_tempo[4] = {0, 0, 0, 0};
     
+    #ifdef DEBUG
     // Debug: mostra estado inicial dos botões via printf
     printf("Botões inicializados. Estados iniciais:\n");
     for (int i = 0; i < 4; i++) {
@@ -639,6 +674,14 @@ void task_botoes(void *p) {
         estado_anterior[i] = estado;  // Inicializa com estado atual
     }
     printf("Aguardando eventos de botões...\n");
+    #else
+    // Inicializa estados anteriores sem debug
+    for (int i = 0; i < 4; i++) {
+        int gpio_val = gpio_get(botoes[i].gpio);
+        bool estado = (gpio_val == 0);  // Pressionado = 0 (pull-up)
+        estado_anterior[i] = estado;  // Inicializa com estado atual
+    }
+    #endif
     
     while (1) {
         uint32_t tempo_atual = to_ms_since_boot(get_absolute_time());
@@ -661,18 +704,23 @@ void task_botoes(void *p) {
                         .valor2 = 0
                     };
                     
-                    // Tenta enviar para a fila (não bloqueia se fila cheia)
-                    BaseType_t resultado = xQueueSend(xQueueEventos, &evento, 0);
+                    // Tenta enviar para a fila de INPUT (eventos críticos)
+                    // Usa timeout para garantir que eventos não sejam perdidos
+                    BaseType_t resultado = xQueueSend(xQueueEventosInput, &evento, TIMEOUT_QUEUE_CRITICO);
                     if (resultado == pdTRUE) {
                         ultimo_tempo[i] = tempo_atual;
                         estado_anterior[i] = estado_atual;
-                        // Debug via printf
+                        #ifdef DEBUG
                         printf("[BOTAO] GP%d=%d -> %s (tecla=0x%02X) [OK]\n", 
                                botoes[i].gpio, gpio_val,
                                estado_atual ? "PRESS" : "RELEASE",
                                botoes[i].tecla);
+                        #endif
                     } else {
-                        printf("[ERRO] Fila cheia! Botão %d (GP%d) não enviado\n", i, botoes[i].gpio);
+                        // ERRO CRÍTICO: evento de botão perdido
+                        printf("[ERRO CRÍTICO] Fila cheia! Botão %d (GP%d, tecla=0x%02X) %s PERDIDO\n", 
+                               i, botoes[i].gpio, botoes[i].tecla,
+                               estado_atual ? "PRESS" : "RELEASE");
                     }
                 }
             }
@@ -894,8 +942,10 @@ void task_imu(void *p) {
                 .valor2 = delta_y
             };
             
-            // Tenta enviar para a fila (não bloqueia se fila estiver cheia)
-            if (xQueueSend(xQueueEventos, &evento_mouse, 0) == pdTRUE) {
+            // Tenta enviar para a fila de IMU (prioridade menor - pode perder eventos se fila cheia)
+            // Não usa timeout: se fila estiver cheia, simplesmente descarta (IMU pode perder frames)
+            if (xQueueSend(xQueueEventosIMU, &evento_mouse, 0) == pdTRUE) {
+                #ifdef DEBUG
                 // Debug: mostra valores a cada 10 leituras (para não poluir o log)
                 static int debug_counter = 0;
                 if (++debug_counter >= 10) {
@@ -903,10 +953,10 @@ void task_imu(void *p) {
                            accel_x, accel_y, accel_z, pitch_avg, roll_avg, delta_x, delta_y);
                     debug_counter = 0;
                 }
-            } else {
-                // Fila cheia - pode acontecer se o PC não estiver lendo rápido o suficiente
-                // Não fazemos nada, apenas pulamos este evento
+                #endif
             }
+            // Se fila cheia - pode acontecer se o PC não estiver lendo rápido o suficiente
+            // Não fazemos nada, apenas pulamos este evento (IMU pode perder frames sem problema)
         }
         
         vTaskDelay(pdMS_TO_TICKS(IMU_DELAY_MS));
@@ -938,11 +988,25 @@ void task_uart_envio(void *p) {
             uart_write_blocking(UART_ID, heartbeat, 4);
             #endif
             ultimo_heartbeat = tempo_atual;
+            #ifdef DEBUG
             printf("Heartbeat enviado\n");
+            #endif
         }
         
-        // Tenta receber evento da fila (não bloqueia por muito tempo)
-        if (xQueueReceive(xQueueEventos, &evento, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // PRIORIDADE: Consome primeiro da fila de INPUT (joystick + botões) - eventos críticos
+        // Só consome da fila IMU se não houver eventos de input pendentes
+        bool evento_processado = false;
+        
+        // Tenta receber evento da fila de INPUT (prioridade máxima)
+        if (xQueueReceive(xQueueEventosInput, &evento, 0) == pdTRUE) {
+            evento_processado = true;
+        } 
+        // Se não houver evento de input, tenta receber da fila IMU (prioridade menor)
+        else if (xQueueReceive(xQueueEventosIMU, &evento, pdMS_TO_TICKS(10)) == pdTRUE) {
+            evento_processado = true;
+        }
+        
+        if (evento_processado) {
             uint8_t mensagem[4] = {0};
             
             switch (evento.tipo) {
@@ -966,9 +1030,11 @@ void task_uart_envio(void *p) {
                     mensagem[2] = (uint8_t)delta_y;   // delta_y (signed 8 bits)
                     mensagem[3] = 0xFF;               // Delimitador
                     
+                    #ifdef DEBUG
                     // Debug: mostra mensagem de mouse enviada
                     printf("[UART] Mouse: delta_x=%d delta_y=%d -> [%02X %02X %02X %02X]\n",
                            delta_x, delta_y, mensagem[0], mensagem[1], mensagem[2], mensagem[3]);
+                    #endif
                     break;
                 }
                 
@@ -988,11 +1054,13 @@ void task_uart_envio(void *p) {
             uart_write_blocking(UART_ID, mensagem, sizeof(mensagem));
             #endif
             
+            #ifdef DEBUG
             // Debug: mostra mensagem enviada (apenas para teclas para não poluir)
             if (evento.tipo == EVENTO_TECLA) {
                 printf("TX: [%02X %02X %02X %02X]\n", 
                        mensagem[0], mensagem[1], mensagem[2], mensagem[3]);
             }
+            #endif
         }
     }
 }
@@ -1056,25 +1124,33 @@ int main(void) {
     // Esta calibração mede o ruído real e calcula thresholds dinâmicos
     calibrar_joystick();
     
-    // Cria fila de eventos
-    xQueueEventos = xQueueCreate(QUEUE_SIZE, sizeof(evento_t));
+    // Cria filas de eventos separadas (priorização: INPUT > IMU)
+    xQueueEventosInput = xQueueCreate(QUEUE_SIZE_INPUT, sizeof(evento_t));
+    xQueueEventosIMU = xQueueCreate(QUEUE_SIZE_IMU, sizeof(evento_t));
     
-    if (xQueueEventos == NULL) {
-        printf("Erro ao criar fila!\n");
+    if (xQueueEventosInput == NULL || xQueueEventosIMU == NULL) {
+        printf("[ERRO] Falha ao criar filas de eventos!\n");
         while (1) {
             tight_loop_contents();
         }
     }
     
-    // Cria tasks do FreeRTOS
+    printf("Filas criadas: INPUT (tamanho=%d), IMU (tamanho=%d)\n", QUEUE_SIZE_INPUT, QUEUE_SIZE_IMU);
+    
+    // Cria tasks do FreeRTOS com prioridades adequadas
     // IMPORTANTE: Para Pico 2 (RP2350), verifique FreeRTOSConfig.h:
     // - configCPU_CLOCK_HZ deve estar configurado para a frequência do RP2350 (ex: 250 MHz)
     // - configTICK_RATE_HZ deve estar adequado (ex: 1000 Hz = 1 ms por tick)
     // - O tick timer deve estar configurado corretamente para o RP2350
-    xTaskCreate(task_joystick, "Joystick", 256, NULL, 1, NULL);  // Task unificada (substitui X e Y)
-    xTaskCreate(task_botoes, "Botoes", 256, NULL, 1, NULL);
-    xTaskCreate(task_imu, "IMU", 512, NULL, 1, NULL);  // Stack maior para IMU
-    xTaskCreate(task_uart_envio, "UART Envio", 256, NULL, 1, NULL);
+    // 
+    // PRIORIDADES:
+    // - PRIORIDADE_UART (3): Máxima - task de envio UART (drena as filas)
+    // - PRIORIDADE_INPUT (2): Alta - joystick e botões (controles primários)
+    // - PRIORIDADE_IMU (1): Baixa - IMU (câmera, pode perder eventos)
+    xTaskCreate(task_uart_envio, "UART Envio", 256, NULL, PRIORIDADE_UART, NULL);  // PRIORIDADE MÁXIMA
+    xTaskCreate(task_joystick, "Joystick", 256, NULL, PRIORIDADE_INPUT, NULL);     // Alta prioridade
+    xTaskCreate(task_botoes, "Botoes", 256, NULL, PRIORIDADE_INPUT, NULL);         // Alta prioridade
+    xTaskCreate(task_imu, "IMU", 512, NULL, PRIORIDADE_IMU, NULL);                 // Baixa prioridade
     
     printf("Sistema iniciado! Controle Megabonk pronto (Pico 2 / RP2350).\n");
     printf("Tasks criadas. Aguardando eventos...\n");
