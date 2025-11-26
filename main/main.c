@@ -167,17 +167,12 @@
 #define BOTAO_VERMELHO_TECLA   TECLA_CTRL     // Left Ctrl - Slide
 
 // Valores de centro calibrados (serão preenchidos na inicialização)
-
-typedef struct {
-    uint16_t center_x;
-    uint16_t center_y;
-    int th_desativa;
-    int th_ativa;
-} JoystickConfig_t;
-
-QueueHandle_t xConfigQueue;
+static uint16_t center_x = 2047;  // Centro do eixo X (será calibrado)
+static uint16_t center_y = 2047;  // Centro do eixo Y (será calibrado)
 
 // Thresholds dinâmicos calculados durante calibração (baseados no ruído real medido)
+static int th_desativa = 80;      // Threshold para sair da direção / voltar ao neutro (será calculado)
+static int th_ativa = 120;        // Threshold para entrar numa direção (será calculado)
 
 // Enum para direções do joystick (máquina de estados)
 typedef enum {
@@ -231,10 +226,7 @@ QueueHandle_t xQueueEventosIMU;   // Fila para eventos de IMU (mouse/câmera) - 
  */
 static void calibrar_joystick(void) {
     printf("Calibrando joystick... mantenha no centro\n");
-    const TickType_t xDelayRTOS = 10 / portTICK_PERIOD_MS;
-    const TickType_t xDelay = 500 / portTICK_PERIOD_MS;
-    vTaskDelay(xDelay);   // Yields to scheduler. RTOS-friendly.
-
+    sleep_ms(500);  // Aguarda usuário posicionar no centro
     
     uint32_t soma_x = 0;
     uint32_t soma_y = 0;
@@ -259,18 +251,12 @@ static void calibrar_joystick(void) {
         uint16_t raw_y = adc_read();
         soma_y += raw_y;
         
-
-        vTaskDelay(xDelayRTOS);   // Yields to scheduler. RTOS-friendly.
+        sleep_ms(10);
     }
-    JoystickConfig_t cfg;
-    cfg.center_x = 2047;
-    cfg.center_y = 2047;
-    cfg.th_desativa = 80;
-    cfg.th_ativa = 120;
     
     // Calcula médias (centros)
-    cfg.center_x = (uint16_t)(soma_x / CALIBRACAO_AMOSTRAS);
-    cfg.center_y = (uint16_t)(soma_y / CALIBRACAO_AMOSTRAS);
+    center_x = (uint16_t)(soma_x / CALIBRACAO_AMOSTRAS);
+    center_y = (uint16_t)(soma_y / CALIBRACAO_AMOSTRAS);
     
     // Segunda passada: mede ruído máximo (desvio em relação ao centro)
     for (int i = 0; i < CALIBRACAO_AMOSTRAS; i++) {
@@ -291,22 +277,22 @@ static void calibrar_joystick(void) {
         if (desvio_y > ruido_max_y) {
             ruido_max_y = desvio_y;
         }
-        vTaskDelay(xDelayRTOS);   // Yields to scheduler. RTOS-friendly.
-
+        
+        sleep_ms(10);
     }
     
     // Calcula thresholds dinâmicos baseados no ruído máximo observado
     // TH_DESATIVA: ruído máximo + margem pequena (zona neutra)
     int ruido_max = (ruido_max_x > ruido_max_y) ? ruido_max_x : ruido_max_y;
-    cfg.th_desativa = ruido_max + MARGEM_RUIDO;
+    th_desativa = ruido_max + MARGEM_RUIDO;
     
     // TH_ATIVA: TH_DESATIVA + margem de ativação (histerese - entrada na direção exige valor maior)
-    cfg.th_ativa = cfg.th_desativa + MARGEM_ATIVA;
+    th_ativa = th_desativa + MARGEM_ATIVA;
     
     printf("Calibração concluída:\n");
-    printf("  center_x=%d, center_y=%d\n", cfg.center_x, cfg.center_y);
+    printf("  center_x=%d, center_y=%d\n", center_x, center_y);
     printf("  ruido_max_x=%d, ruido_max_y=%d, ruido_max=%d\n", ruido_max_x, ruido_max_y, ruido_max);
-    printf("  TH_DESATIVA=%d (zona neutra), TH_ATIVA=%d (entrada na direção)\n", cfg.th_desativa, cfg.th_ativa);
+    printf("  TH_DESATIVA=%d (zona neutra), TH_ATIVA=%d (entrada na direção)\n", th_desativa, th_ativa);
 }
 
 /**
@@ -356,11 +342,8 @@ static void ler_joystick(int *delta_x, int *delta_y) {
     // Calcula deltas em relação ao centro calibrado
     // NOTA: NÃO aplica deadzone aqui - será aplicada na task para permitir
     // escolha do eixo dominante baseada nos valores absolutos
-    JoystickConfig_t cfg;
-    cfg.center_x = 2047;
-    cfg.center_y = 2047;
-    *delta_x = media_x - (int)cfg.center_x;
-    *delta_y = media_y - (int)cfg.center_y;
+    *delta_x = media_x - (int)center_x;
+    *delta_y = media_y - (int)center_y;
 }
 
 // ========================= FUNÇÕES AUXILIARES - JOYSTICK =========================
@@ -446,13 +429,9 @@ static joy_dir_t calcular_direcao(int delta_x, int delta_y, joy_dir_t direcao_at
     int abs_x = (delta_x < 0) ? -delta_x : delta_x;
     int abs_y = (delta_y < 0) ? -delta_y : delta_y;
     
-    JoystickConfig_t cfg;
-    cfg.th_desativa = 80;
-    cfg.th_ativa = 120;
-    
     // 1) HISTERESE: Se já estamos em uma direção, só volta ao NEUTRO se ambos eixos caírem abaixo de TH_DESATIVA
     if (direcao_atual != JOY_NEUTRO) {
-        if (abs_x < cfg.th_desativa && abs_y < cfg.th_desativa) {
+        if (abs_x < th_desativa && abs_y < th_desativa) {
             // Ambos eixos abaixo do threshold de desativação → volta ao neutro
             return JOY_NEUTRO;
         }
@@ -478,10 +457,10 @@ static joy_dir_t calcular_direcao(int delta_x, int delta_y, joy_dir_t direcao_at
     
     // 4) Eixo Y domina (vertical) - FRENTE ou TRÁS
     if (eixo_vertical_domina) {
-        if (delta_y < -cfg.th_ativa) {
+        if (delta_y < -th_ativa) {
             // Movimento para frente (negativo) acima de TH_ATIVA → FRENTE (muda direção mesmo se já estava em outra)
             return JOY_FRENTE;
-        } else if (delta_y > cfg.th_ativa) {
+        } else if (delta_y > th_ativa) {
             // Movimento para trás (positivo) acima de TH_ATIVA → TRÁS (muda direção mesmo se já estava em outra)
             return JOY_TRAS;
         } else {
@@ -491,9 +470,9 @@ static joy_dir_t calcular_direcao(int delta_x, int delta_y, joy_dir_t direcao_at
                 return direcao_atual;
             }
             // Se não estava em direção vertical, verifica eixo X como fallback
-            if (delta_x > cfg.th_ativa) {
+            if (delta_x > th_ativa) {
                 return JOY_DIREITA;
-            } else if (delta_x < -cfg.th_ativa) {
+            } else if (delta_x < -th_ativa) {
                 return JOY_ESQUERDA;
             }
             // Se nenhum passou de TH_ATIVA, mantém direção atual ou retorna NEUTRO
@@ -503,10 +482,10 @@ static joy_dir_t calcular_direcao(int delta_x, int delta_y, joy_dir_t direcao_at
     
     // 5) Eixo X domina (horizontal) - ESQUERDA ou DIREITA
     if (eixo_horizontal_domina) {
-        if (delta_x > cfg.th_ativa) {
+        if (delta_x > th_ativa) {
             // Movimento para direita (positivo) acima de TH_ATIVA → DIREITA (muda direção mesmo se já estava em outra)
             return JOY_DIREITA;
-        } else if (delta_x < -cfg.th_ativa) {
+        } else if (delta_x < -th_ativa) {
             // Movimento para esquerda (negativo) acima de TH_ATIVA → ESQUERDA (muda direção mesmo se já estava em outra)
             return JOY_ESQUERDA;
         } else {
@@ -516,9 +495,9 @@ static joy_dir_t calcular_direcao(int delta_x, int delta_y, joy_dir_t direcao_at
                 return direcao_atual;
             }
             // Se não estava em direção horizontal, verifica eixo Y como fallback
-            if (delta_y < -cfg.th_ativa) {
+            if (delta_y < -th_ativa) {
                 return JOY_FRENTE;
-            } else if (delta_y > cfg.th_ativa) {
+            } else if (delta_y > th_ativa) {
                 return JOY_TRAS;
             }
             // Se nenhum passou de TH_ATIVA, mantém direção atual ou retorna NEUTRO
@@ -548,8 +527,7 @@ void task_joystick(void *p) {
     adc_gpio_init(GPIO_JOYSTICK_Y);
     
     // Aguarda calibração ser concluída
-    const TickType_t xDelayCalibrate = 2000 / portTICK_PERIOD_MS;
-    vTaskDelay(xDelayCalibrate);   // Yields to scheduler. RTOS-friendly.
+    sleep_ms(2000);
     
     // Estado atual das teclas virtuais WASD (stateful, nunca toggle)
     // true = tecla está sendo considerada como segurada pelo PC
@@ -561,11 +539,9 @@ void task_joystick(void *p) {
     
     // Estado atual da direção do joystick (para histerese e margem angular)
     static joy_dir_t direcao_atual = JOY_NEUTRO;
-    JoystickConfig_t cfg;
-    cfg.th_desativa = 80;
-    cfg.th_ativa = 120;
+    
     printf("Task joystick iniciada (comportamento digital com thresholds dinâmicos e histerese)\n");
-    printf("Thresholds calculados: TH_DESATIVA=%d, TH_ATIVA=%d\n", cfg.th_desativa, cfg.th_ativa);
+    printf("Thresholds calculados: TH_DESATIVA=%d, TH_ATIVA=%d\n", th_desativa, th_ativa);
     printf("Margens angulares: Vertical=%.1f, Horizontal=%.1f\n", FATOR_PRIORIZA_VERTICAL, FATOR_PRIORIZA_HORIZONTAL);
     
     while (1) {
@@ -625,7 +601,7 @@ void task_joystick(void *p) {
             int abs_y = (delta_y < 0) ? -delta_y : delta_y;
             
             printf("[JOY DEBUG] raw: x=%d y=%d | delta: x=%d y=%d | abs: x=%d y=%d | dir=%d (TH_DESATIVA=%d, TH_ATIVA=%d)\n",
-                   raw_x, raw_y, delta_x, delta_y, abs_x, abs_y, direcao_nova, cfg.th_desativa, cfg.th_ativa);
+                   raw_x, raw_y, delta_x, delta_y, abs_x, abs_y, direcao_nova, th_desativa, th_ativa);
             printf("[JOY DEBUG] Estados: W=%s A=%s S=%s D=%s | Desejados: W=%s A=%s S=%s D=%s\n",
                    w_pressionada ? "ON" : "OFF", a_pressionada ? "ON" : "OFF",
                    s_pressionada ? "ON" : "OFF", d_pressionada ? "ON" : "OFF",
@@ -640,7 +616,7 @@ void task_joystick(void *p) {
             int abs_x = (delta_x < 0) ? -delta_x : delta_x;
             int abs_y = (delta_y < 0) ? -delta_y : delta_y;
             printf("[JOY RUÍDO] Centro: delta_x=%d delta_y=%d | abs_x=%d abs_y=%d (TH_DESATIVA=%d, TH_ATIVA=%d)\n",
-                   delta_x, delta_y, abs_x, abs_y, cfg.th_desativa, cfg.th_ativa);
+                   delta_x, delta_y, abs_x, abs_y, th_desativa, th_ativa);
             debug_ruido_counter = 0;
         }
         #endif
@@ -762,19 +738,18 @@ void task_botoes(void *p) {
  */
 static bool imu_init(void) {
     // Tenta escrever no power management register para acordar o dispositivo
-    // Registrador 0x6B: escreve 0x00 para sair do modo necas
+    // Registrador 0x6B: escreve 0x00 para sair do modo sleep
     uint8_t buf[2] = {MPU6050_PWR_MGMT, 0x00};
     int ret = i2c_write_blocking(I2C_PORT, MPU6050_ADDR, buf, 2, false);
     
     // Se ret < 0, houve erro (dispositivo não responde)
     // Se ret != 2, não escreveu todos os bytes (também erro)
-    if (ret != 2) {
+    if (ret < 0 || ret != 2) {
         return false;  // IMU não está conectado ou não responde
     }
     
     // Pequeno delay para estabilização
-    const TickType_t xDelayIMU = 10 / portTICK_PERIOD_MS;
-    vTaskDelay(xDelayIMU);   // Yields to scheduler. RTOS-friendly.
+    sleep_ms(100);
     return true;
 }
 
@@ -860,8 +835,7 @@ void task_imu(void *p) {
     gpio_pull_up(I2C_SCL_PIN);  // Pull-up interno habilitado
     
     // Pequeno delay para estabilização
-    const TickType_t xDelay = 100 / portTICK_PERIOD_MS;
-    vTaskDelay(xDelay);   // Yields to scheduler. RTOS-friendly.
+    sleep_ms(100);
     
     // Tenta inicializar MPU6050
     printf("[IMU] Tentando inicializar MPU6050 (endereço 0x%02X)...\n", MPU6050_ADDR);
@@ -871,8 +845,7 @@ void task_imu(void *p) {
         int16_t test_reads[3] = {0};
         for (int i = 0; i < 3; i++) {
             test_reads[i] = imu_read_16bit(MPU6050_ACCEL_XOUT);
-            const TickType_t xDelayFor = 10 / portTICK_PERIOD_MS;
-            vTaskDelay(xDelayFor);   // Yields to scheduler. RTOS-friendly.
+            sleep_ms(10);
         }
         
         // Se pelo menos uma leitura retornou valor diferente de 0, IMU está conectado
@@ -1107,12 +1080,12 @@ int main(void) {
     uart_init(UART_ID, UART_BAUD_RATE);
     gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
-    const TickType_t xDelay = 100 / portTICK_PERIOD_MS;
+    
     // Pequeno delay para estabilização do UART
-    vTaskDelay(xDelay);   // Yields to scheduler. RTOS-friendly.
+    sleep_ms(100);
     #else
     // USB-CDC é inicializado automaticamente pelo stdio_init_all()
-    vTaskDelay(500 / portTICK_PERIOD_MS);   // Pequeno delay para estabilização
+    sleep_ms(500);  // Delay maior para USB estabilizar
     #endif
     
     // Teste: envia mensagem de inicialização
@@ -1130,7 +1103,7 @@ int main(void) {
     #endif
     
     // Pequeno delay antes de continuar
-    vTaskDelay(200 / portTICK_PERIOD_MS);   // Yields to scheduler. RTOS-friendly.
+    sleep_ms(200);
     
     // Inicializa ADC (para joystick analógico)
     // IMPORTANTE: Na Pico 2 (RP2350), o ADC é compatível com RP2040
@@ -1145,7 +1118,7 @@ int main(void) {
     
     // Pequeno delay para estabilização do ADC após inicialização
     // Na Pico 2, o ADC pode precisar de um momento para estabilizar a referência interna
-    vTaskDelay(50 / portTICK_PERIOD_MS);   // Yields to scheduler. RTOS-friendly.
+    sleep_ms(50);
     
     // Calibra o centro do joystick (DEVE ser feito antes de criar as tasks)
     // Esta calibração mede o ruído real e calcula thresholds dinâmicos

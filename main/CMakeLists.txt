@@ -23,6 +23,8 @@ target_link_libraries(pico_emb PRIVATE
     #ssd1306_lib
     pico_stdlib
     hardware_adc
+    tinyusb_device
+    tinyusb_board
     )
 
 # Para usar USB-CDC em vez de UART hardware, descomente as linhas abaixo:

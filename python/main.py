@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Programa para ler UART do controle Megabonk e simular teclas/mouse no PC
+Programa para ler UART do controle Megabonk e simular teclas / movimento de câmera via vJoy
 Compatível com o firmware main.c atualizado
+No Windows: usa pyautogui para teclado e pyvjoy (vJoy) para eixos de câmera.
 """
 
 import serial
 import time
 import pyautogui
 import sys
+import pyvjoy   # <<< novo
 
 # Desabilita failsafe e pausa do pyautogui para resposta rápida
 pyautogui.PAUSE = 0
@@ -41,12 +43,33 @@ TECLA_MAP = {
     TECLA_D: 'd',
     TECLA_SPACE: 'space',
     TECLA_E: 'e',
-    TECLA_TAB: 'tab',
+    TECLA_TAB: 'tab', 
     TECLA_CTRL: 'ctrl'
 }
 
 # Estados das teclas (para evitar spam)
 teclas_pressionadas = set()
+
+# ========================= ESTADO DO vJoy =========================
+
+# Valores padrão do vJoy (16 bits: 0 .. 32767)
+VJOY_MAX = 0x8000 - 1         # 32767
+VJOY_CENTER = VJOY_MAX // 2   # ~16383
+
+# Vamos usar os eixos X/Y como câmera (ou RX/RY, se preferir)
+# Em vez de X/Y, use RX/RY:
+VJOY_AXIS_X = pyvjoy.HID_USAGE_RX   # eixo look horizontal
+VJOY_AXIS_Y = pyvjoy.HID_USAGE_RY   # eixo look vertical
+
+# Estado global do joystick
+j = None
+vjoy_x = VJOY_CENTER
+vjoy_y = VJOY_CENTER
+
+# Sensibilidade: quanto 1 "delta" da IMU mexe o eixo do joystick
+VJOY_SENS = 300   # ajuste isso se a câmera estiver lenta/rápida demais
+DEADZONE = 2     # ignora deltas muito pequenos (ruído)
+VJOY_SPRING = 0.15
 
 # ========================= FUNÇÕES DE PROCESSAMENTO =========================
 
@@ -79,54 +102,124 @@ def processar_tecla(tecla_ascii, press_release):
     except Exception as e:
         print(f"Erro ao processar tecla {nome_tecla}: {e}")
 
+
 def processar_mouse(delta_x, delta_y):
     """
-    Processa movimento de mouse/câmera via IMU
+    Processa movimento de câmera via IMU -> eixos do vJoy (pyvjoy)
     Args:
         delta_x: Movimento horizontal (signed byte)
         delta_y: Movimento vertical (signed byte)
     """
+    global j, vjoy_x, vjoy_y
+
+    if j is None:
+        # vJoy não inicializado
+        return
+
     try:
         # Converte bytes sem sinal para valores com sinal
-        # Se o bit mais significativo for 1, é negativo
         if delta_x > 127:
             delta_x = delta_x - 256
         if delta_y > 127:
             delta_y = delta_y - 256
-        
-        # Move o mouse (câmera)
-        if delta_x != 0 or delta_y != 0:
-            pyautogui.moveRel(delta_x, delta_y, duration=0)
-            # print(f"Mouse: dx={delta_x}, dy={delta_y}")
+
+        if DEBUG:
+            print(f"[SIGNED] dx={delta_x}, dy={delta_y}")
+
+
+        # Axis isolation: choose dominant axis
+        # HARD FILTER: if vertical movement is large, kill horizontal movement
+        if delta_y > 100 or delta_y < -100:
+            delta_x = 0
+            print(delta_x, delta_y)
+            if DEBUG:
+                print(f"Filtered: dx={delta_x}, dy={delta_y}")
+
+
+
+        # Aplica deadzone para evitar ruído
+        if abs(delta_x) < DEADZONE:
+            delta_x = 0
+        if abs(delta_y) < DEADZONE:
+            delta_y = 0
+
+
+
+        # Se não há movimento significativo, centraliza
+        if delta_x == 0 and delta_y == 0:
+            vjoy_x = VJOY_CENTER
+            vjoy_y = VJOY_CENTER
+        else:
+            # Mapeia delta diretamente ao redor do centro (sem acumular)
+            vjoy_x = VJOY_CENTER + delta_x * VJOY_SENS
+            vjoy_y = VJOY_CENTER - delta_y * VJOY_SENS  # inverte Y se quiser estilo FPS
+
+        # Garante que fique dentro do range do vJoy
+        vjoy_x = max(0, min(VJOY_MAX, vjoy_x))
+        vjoy_y = max(0, min(VJOY_MAX, vjoy_y))
+
+        j.set_axis(VJOY_AXIS_X, vjoy_x)
+        j.set_axis(VJOY_AXIS_Y, vjoy_y)
+
+        if DEBUG:
+            print(f"vJoy: X={vjoy_x}, Y={vjoy_y}, dx={delta_x}, dy={delta_y}")
+
     except Exception as e:
-        print(f"Erro ao mover mouse: {e}")
+        print(f"Erro ao mover câmera (vJoy): {e}")
+
+
 
 def processar_botao_joystick(press_release):
     """
-    Processa botão do joystick (Left Mouse Button - Aim)
-    Args:
-        press_release: 1 = pressionado, 0 = solto
+    Processa botão do joystick.
+    Aqui você pode tanto:
+      - continuar usando o mouse real (pyautogui.mouseDown), ou
+      - mapear para um botão do vJoy (ex: botão 1) para o jogo ver como "fire/aim".
     """
+    global j
+
     try:
+        # Exemplo 1: continuar usando clique do mouse real
+        # (o jogo precisa aceitar input de mouse real)
         if press_release == 1:
             pyautogui.mouseDown(button='left')
             print("Botão joystick: Pressionado (Aim)")
         else:
             pyautogui.mouseUp(button='left')
             print("Botão joystick: Solto")
+
+        # Exemplo 2 (opcional): também acionar um botão do vJoy (botão 1)
+        # if j is not None:
+        #     j.set_button(1, 1 if press_release == 1 else 0)
+
     except Exception as e:
         print(f"Erro ao processar botão joystick: {e}")
+
 
 # ========================= FUNÇÃO PRINCIPAL =========================
 
 def main():
-    global DEBUG
-    
+    global DEBUG, j, vjoy_x, vjoy_y
+
     # Verifica argumentos de linha de comando
     if '--debug' in sys.argv or '-d' in sys.argv:
         DEBUG = True
         print("Modo DEBUG ativado")
-    
+
+    # Inicializa vJoy
+    try:
+        j = pyvjoy.VJoyDevice(1)  # usa o device ID 1 configurado no vJoy
+        vjoy_x = VJOY_CENTER
+        vjoy_y = VJOY_CENTER
+        j.set_axis(VJOY_AXIS_X, vjoy_x)
+        j.set_axis(VJOY_AXIS_Y, vjoy_y)
+        print("vJoy inicializado (Device ID 1).")
+    except Exception as e:
+        print(f"Falha ao inicializar vJoy / pyvjoy: {e}")
+        print("Verifique se o driver vJoy está instalado e se o Device 1 está habilitado.")
+        # se quiser, pode dar return aqui:
+        # return
+
     # Solicita porta serial
     if len(sys.argv) > 1:
         # Filtra argumentos de debug
@@ -178,7 +271,6 @@ def main():
                 # Verifica delimitador final (deve ser 0xFF)
                 if byte3 != 0xFF:
                     # Mensagem inválida, descarta e procura próximo header válido
-                    # Procura próximo header válido no buffer
                     header_pos = -1
                     for i in range(1, len(buffer)):
                         if buffer[i] in (HEADER_TECLA, HEADER_MOUSE, HEADER_BOTAO_JOY):
@@ -208,8 +300,9 @@ def main():
                     # Protocolo: [0x4D, delta_x, delta_y, 0xFF]
                     delta_x = byte1
                     delta_y = byte2
+                    #print(f"RAW UART mouse bytes: dx_byte={delta_x:3d}, dy_byte={delta_y:3d}")
                     if DEBUG:
-                        print(f"  -> Mouse: dx={delta_x}, dy={delta_y}")
+                        print(f"RAW UART mouse bytes: dx_byte={delta_x:3d}, dy_byte={delta_y:3d}")
                     processar_mouse(delta_x, delta_y)
                 
                 elif header == HEADER_BOTAO_JOY:
@@ -244,6 +337,14 @@ def main():
                 pass
         teclas_pressionadas.clear()
         
+        # Centraliza eixos novamente ao sair
+        if j is not None:
+            try:
+                j.set_axis(VJOY_AXIS_X, VJOY_CENTER)
+                j.set_axis(VJOY_AXIS_Y, VJOY_CENTER)
+            except:
+                pass
+
         # Fecha conexão serial
         if 'ser' in locals() and ser.is_open:
             ser.close()
