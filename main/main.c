@@ -175,13 +175,6 @@ static int th_desativa = 80;      // Threshold para sair da direção / voltar a
 static int th_ativa = 120;        // Threshold para entrar numa direção (será calculado)
 
 // Enum para direções do joystick (máquina de estados)
-typedef enum {
-    JOY_NEUTRO = 0,
-    JOY_ESQUERDA,
-    JOY_DIREITA,
-    JOY_FRENTE,
-    JOY_TRAS
-} joy_dir_t;
 
 // Tipos de dados do IMU (para movimento de câmera)
 #define IMU_PITCH          0
@@ -410,114 +403,9 @@ static void atualiza_tecla_virtual(uint8_t tecla, bool *estado_atual, bool estad
     // Caso contrário, não faz nada (estado não mudou - tecla continua como está)
 }
 
-/**
- * Calcula a direção do joystick baseada em delta_x, delta_y e direcao_atual
- * Implementa histerese explícita e margem angular para máxima precisão
- * 
- * Histerese:
- * - Para ENTRAR numa direção: eixo dominante deve ultrapassar TH_ATIVA
- * - Para SAIR da direção: ambos eixos devem cair abaixo de TH_DESATIVA
- * 
- * Margem angular:
- * - Usa FATOR_PRIORIZA_VERTICAL e FATOR_PRIORIZA_HORIZONTAL para decidir eixo dominante
- * - Em região ambígua, mantém direcao_atual (evita alternância entre direções)
- * 
- * Retorna JOY_NEUTRO ou uma das direções (FRENTE, TRAS, ESQUERDA, DIREITA)
- * Escolhe apenas UMA direção por vez (sem diagonais)
- */
-static joy_dir_t calcular_direcao(int delta_x, int delta_y, joy_dir_t direcao_atual) {
-    int abs_x = (delta_x < 0) ? -delta_x : delta_x;
-    int abs_y = (delta_y < 0) ? -delta_y : delta_y;
-    
-    // 1) HISTERESE: Se já estamos em uma direção, só volta ao NEUTRO se ambos eixos caírem abaixo de TH_DESATIVA
-    if (direcao_atual != JOY_NEUTRO) {
-        if (abs_x < th_desativa && abs_y < th_desativa) {
-            // Ambos eixos abaixo do threshold de desativação → volta ao neutro
-            return JOY_NEUTRO;
-        }
-    }
-    
-    // 2) Decide eixo dominante usando margem angular (evita alternância)
-    bool eixo_vertical_domina = (abs_y > abs_x * FATOR_PRIORIZA_VERTICAL);
-    bool eixo_horizontal_domina = (abs_x > abs_y * FATOR_PRIORIZA_HORIZONTAL);
-    
-    // 3) Região ambígua: nenhum eixo domina claramente
-    if (!eixo_vertical_domina && !eixo_horizontal_domina) {
-        // Mantém a direção atual se não for neutro (evita piscadas)
-        if (direcao_atual != JOY_NEUTRO) {
-            return direcao_atual;
-        }
-        // Se está no neutro e região ambígua, verifica qual eixo está ligeiramente maior
-        if (abs_y > abs_x) {
-            eixo_vertical_domina = true;
-        } else {
-            eixo_horizontal_domina = true;
-        }
-    }
-    
-    // 4) Eixo Y domina (vertical) - FRENTE ou TRÁS
-    if (eixo_vertical_domina) {
-        if (delta_y < -th_ativa) {
-            // Movimento para frente (negativo) acima de TH_ATIVA → FRENTE (muda direção mesmo se já estava em outra)
-            return JOY_FRENTE;
-        } else if (delta_y > th_ativa) {
-            // Movimento para trás (positivo) acima de TH_ATIVA → TRÁS (muda direção mesmo se já estava em outra)
-            return JOY_TRAS;
-        } else {
-            // Y não passou de TH_ATIVA
-            // Se já estava em uma direção vertical, mantém (histerese)
-            if (direcao_atual == JOY_FRENTE || direcao_atual == JOY_TRAS) {
-                return direcao_atual;
-            }
-            // Se não estava em direção vertical, verifica eixo X como fallback
-            if (delta_x > th_ativa) {
-                return JOY_DIREITA;
-            } else if (delta_x < -th_ativa) {
-                return JOY_ESQUERDA;
-            }
-            // Se nenhum passou de TH_ATIVA, mantém direção atual ou retorna NEUTRO
-            return (direcao_atual != JOY_NEUTRO) ? direcao_atual : JOY_NEUTRO;
-        }
-    }
-    
-    // 5) Eixo X domina (horizontal) - ESQUERDA ou DIREITA
-    if (eixo_horizontal_domina) {
-        if (delta_x > th_ativa) {
-            // Movimento para direita (positivo) acima de TH_ATIVA → DIREITA (muda direção mesmo se já estava em outra)
-            return JOY_DIREITA;
-        } else if (delta_x < -th_ativa) {
-            // Movimento para esquerda (negativo) acima de TH_ATIVA → ESQUERDA (muda direção mesmo se já estava em outra)
-            return JOY_ESQUERDA;
-        } else {
-            // X não passou de TH_ATIVA
-            // Se já estava em uma direção horizontal, mantém (histerese)
-            if (direcao_atual == JOY_ESQUERDA || direcao_atual == JOY_DIREITA) {
-                return direcao_atual;
-            }
-            // Se não estava em direção horizontal, verifica eixo Y como fallback
-            if (delta_y < -th_ativa) {
-                return JOY_FRENTE;
-            } else if (delta_y > th_ativa) {
-                return JOY_TRAS;
-            }
-            // Se nenhum passou de TH_ATIVA, mantém direção atual ou retorna NEUTRO
-            return (direcao_atual != JOY_NEUTRO) ? direcao_atual : JOY_NEUTRO;
-        }
-    }
-    
-    // Fallback: retorna NEUTRO (ou mantém direção atual se já estava em uma)
-    return (direcao_atual != JOY_NEUTRO) ? direcao_atual : JOY_NEUTRO;
-}
-
 // ========================= TASK: JOYSTICK (UNIFICADA COM PRESS/RELEASE) =========================
+// ========================= TASK: JOYSTICK (AGORA COM DIAGONAIS) =========================
 
-/**
- * Task unificada do joystick com máquina de estados e transições diretas
- * Garante:
- * - Troca direta de direção (ex: FRENTE → DIREITA) sem precisar passar pelo centro
- * - Parada total quando volta ao centro (sempre envia RELEASE)
- * - Comportamento de controle real de console
- */
 void task_joystick(void *p) {
     (void)p;
     
@@ -529,98 +417,91 @@ void task_joystick(void *p) {
     // Aguarda calibração ser concluída
     sleep_ms(2000);
     
-    // Estado atual das teclas virtuais WASD (stateful, nunca toggle)
-    // true = tecla está sendo considerada como segurada pelo PC
-    // false = tecla está solta
+    // Estado atual das teclas virtuais WASD
     static bool w_pressionada = false;
     static bool a_pressionada = false;
     static bool s_pressionada = false;
     static bool d_pressionada = false;
-    
-    // Estado atual da direção do joystick (para histerese e margem angular)
-    static joy_dir_t direcao_atual = JOY_NEUTRO;
-    
-    printf("Task joystick iniciada (comportamento digital com thresholds dinâmicos e histerese)\n");
-    printf("Thresholds calculados: TH_DESATIVA=%d, TH_ATIVA=%d\n", th_desativa, th_ativa);
-    printf("Margens angulares: Vertical=%.1f, Horizontal=%.1f\n", FATOR_PRIORIZA_VERTICAL, FATOR_PRIORIZA_HORIZONTAL);
+
+    printf("Task joystick iniciada (modo DIAGONAL: eixos independentes)\n");
+    printf("Thresholds: TH_DESATIVA=%d, TH_ATIVA=%d\n", th_desativa, th_ativa);
     
     while (1) {
-        // 1) Lê valores brutos e deltas
         int delta_x, delta_y;
         ler_joystick(&delta_x, &delta_y);
-        
-        // 2) Calcula direção nova baseada nos deltas, usando direcao_atual para histerese
-        joy_dir_t direcao_nova = calcular_direcao(delta_x, delta_y, direcao_atual);
-        
-        // Atualiza direcao_atual para próxima iteração
-        direcao_atual = direcao_nova;
-        
-        // 3) Define quais teclas DEVEM estar pressionadas AGORA (baseado na direção)
-        // Começa "zerando" o estado desejado
-        bool w_desejada = false;
-        bool a_desejada = false;
-        bool s_desejada = false;
-        bool d_desejada = false;
-        
-        // De acordo com direcao_nova, marca APENAS UMA como verdadeira
-        switch (direcao_nova) {
-            case JOY_FRENTE:
+
+        int abs_x = (delta_x < 0) ? -delta_x : delta_x;
+        int abs_y = (delta_y < 0) ? -delta_y : delta_y;
+
+        // Começa do estado atual (para aplicar histerese por eixo)
+        bool w_desejada = w_pressionada;
+        bool s_desejada = s_pressionada;
+        bool a_desejada = a_pressionada;
+        bool d_desejada = d_pressionada;
+
+        // ================== EIXO VERTICAL (W / S) ==================
+        // delta_y < 0 -> FRENTE (W)
+        // delta_y > 0 -> TRÁS   (S)
+
+        if (abs_y > th_ativa) {
+            // Fora da zona morta -> queremos alguma direção vertical
+            if (delta_y < 0) {
+                // Frente
                 w_desejada = true;
-                break;
-            case JOY_TRAS:
+                s_desejada = false;   // Não andar pra frente e pra trás ao mesmo tempo
+            } else {
+                // Trás
                 s_desejada = true;
-                break;
-            case JOY_ESQUERDA:
-                a_desejada = true;
-                break;
-            case JOY_DIREITA:
-                d_desejada = true;
-                break;
-            case JOY_NEUTRO:
-            default:
-                // Todas permanecem false (centro = todas soltas)
-                break;
+                w_desejada = false;
+            }
+        } else if (abs_y < th_desativa) {
+            // Voltou bem perto do centro -> solta ambas
+            w_desejada = false;
+            s_desejada = false;
         }
-        
-        // 4) Compara estado atual vs estado desejado e envia PRESS/RELEASE
-        // Isso garante que:
-        // - Press é enviado somente quando a tecla passa de "solta" → "pressionada"
-        // - Release é enviado somente quando a tecla passa de "pressionada" → "solta"
-        // - Não há toggles
-        // - Não há "tecla presa" após o analógico voltar ao centro
+        // Se ficar entre TH_DESATIVA e TH_ATIVA, mantemos estado atual (histerese)
+
+        // ================== EIXO HORIZONTAL (A / D) ==================
+        // delta_x < 0 -> ESQUERDA (A)
+        // delta_x > 0 -> DIREITA  (D)
+
+        if (abs_x > th_ativa) {
+            if (delta_x < 0) {
+                // Esquerda
+                a_desejada = true;
+                d_desejada = false;
+            } else {
+                // Direita
+                d_desejada = true;
+                a_desejada = false;
+            }
+        } else if (abs_x < th_desativa) {
+            a_desejada = false;
+            d_desejada = false;
+        }
+        // Mesma histerese no eixo horizontal
+
+        // Agora, como os dois eixos são independentes, podemos ter:
+        // - Só W, só A, só S, só D
+        // - W + A, W + D, S + A, S + D  (DIAGONAIS!)
+        // - Nenhuma (parado)
+
         atualiza_tecla_virtual(TECLA_W, &w_pressionada, w_desejada);
         atualiza_tecla_virtual(TECLA_A, &a_pressionada, a_desejada);
         atualiza_tecla_virtual(TECLA_S, &s_pressionada, s_desejada);
         atualiza_tecla_virtual(TECLA_D, &d_pressionada, d_desejada);
-        
+
         #ifdef DEBUG
-        // Debug detalhado (a cada 20 leituras para não poluir)
         static int debug_counter = 0;
         if (++debug_counter >= 20) {
-            int abs_x = (delta_x < 0) ? -delta_x : delta_x;
-            int abs_y = (delta_y < 0) ? -delta_y : delta_y;
-            
-            printf("[JOY DEBUG] raw: x=%d y=%d | delta: x=%d y=%d | abs: x=%d y=%d | dir=%d (TH_DESATIVA=%d, TH_ATIVA=%d)\n",
-                   raw_x, raw_y, delta_x, delta_y, abs_x, abs_y, direcao_nova, th_desativa, th_ativa);
-            printf("[JOY DEBUG] Estados: W=%s A=%s S=%s D=%s | Desejados: W=%s A=%s S=%s D=%s\n",
-                   w_pressionada ? "ON" : "OFF", a_pressionada ? "ON" : "OFF",
-                   s_pressionada ? "ON" : "OFF", d_pressionada ? "ON" : "OFF",
-                   w_desejada ? "ON" : "OFF", a_desejada ? "ON" : "OFF",
-                   s_desejada ? "ON" : "OFF", d_desejada ? "ON" : "OFF");
+            printf("[JOY] dx=%d dy=%d | absx=%d absy=%d | W=%d A=%d S=%d D=%d (desaj: W=%d A=%d S=%d D=%d)\n",
+                   delta_x, delta_y, abs_x, abs_y,
+                   w_pressionada, a_pressionada, s_pressionada, d_pressionada,
+                   w_desejada, a_desejada, s_desejada, d_desejada);
             debug_counter = 0;
         }
-        
-        // Debug de ruído quando no centro (para verificar se thresholds estão adequados)
-        static int debug_ruido_counter = 0;
-        if (direcao_nova == JOY_NEUTRO && ++debug_ruido_counter >= 50) {
-            int abs_x = (delta_x < 0) ? -delta_x : delta_x;
-            int abs_y = (delta_y < 0) ? -delta_y : delta_y;
-            printf("[JOY RUÍDO] Centro: delta_x=%d delta_y=%d | abs_x=%d abs_y=%d (TH_DESATIVA=%d, TH_ATIVA=%d)\n",
-                   delta_x, delta_y, abs_x, abs_y, th_desativa, th_ativa);
-            debug_ruido_counter = 0;
-        }
         #endif
-        
+
         vTaskDelay(pdMS_TO_TICKS(JOYSTICK_DELAY_MS));
     }
 }
@@ -891,6 +772,8 @@ void task_imu(void *p) {
         int16_t accel_x = imu_read_16bit(MPU6050_ACCEL_XOUT);      // 0x3B (high byte)
         int16_t accel_y = imu_read_16bit(MPU6050_ACCEL_XOUT + 2);   // 0x3D (high byte)
         int16_t accel_z = imu_read_16bit(MPU6050_ACCEL_XOUT + 4);   // 0x3F (high byte)
+        printf("[IMU RAW] ax=%d ay=%d az=%d\n", accel_x, accel_y, accel_z);
+
         
         // Verifica se houve erro na leitura (todos zeros pode ser erro ou válido)
         // Se for erro, os valores serão 0, mas não vamos bloquear por isso
@@ -930,6 +813,9 @@ void task_imu(void *p) {
         if (abs_delta_x >= IMU_MOUSE_THRESHOLD || abs_delta_y >= IMU_MOUSE_THRESHOLD) {
             // Limita valores para caber em 8 bits (protocolo usa 1 byte por delta)
             // Range: -128 a +127
+            printf("[IMU DEBUG] delta_x=%d, delta_y=%d (abs_x=%d, abs_y=%d)\n",
+            delta_x, delta_y, abs_delta_x, abs_delta_y);
+            
             if (delta_x > 127) delta_x = 127;
             if (delta_x < -128) delta_x = -128;
             if (delta_y > 127) delta_y = 127;
@@ -944,6 +830,10 @@ void task_imu(void *p) {
             
             // Tenta enviar para a fila de IMU (prioridade menor - pode perder eventos se fila cheia)
             // Não usa timeout: se fila estiver cheia, simplesmente descarta (IMU pode perder frames)
+                if (xQueueSend(xQueueEventosIMU, &evento_mouse, 0) != pdTRUE) {
+                    printf("[IMU DEBUG] Fila IMU cheia, evento descartado!\n");
+                }
+
             if (xQueueSend(xQueueEventosIMU, &evento_mouse, 0) == pdTRUE) {
                 #ifdef DEBUG
                 // Debug: mostra valores a cada 10 leituras (para não poluir o log)
@@ -1029,6 +919,9 @@ void task_uart_envio(void *p) {
                     mensagem[1] = (uint8_t)delta_x;   // delta_x (signed 8 bits)
                     mensagem[2] = (uint8_t)delta_y;   // delta_y (signed 8 bits)
                     mensagem[3] = 0xFF;               // Delimitador
+                    printf("[UART IMU] Enviando mouse: dx=%d dy=%d -> [%02X %02X %02X %02X]\n",
+           delta_x, delta_y, mensagem[0], mensagem[1], mensagem[2], mensagem[3]);
+
                     
                     #ifdef DEBUG
                     // Debug: mostra mensagem de mouse enviada
