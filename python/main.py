@@ -86,7 +86,7 @@ def processar_tecla(tecla_ascii, press_release):
     # Deadzone state
     # Estado da deadzone de WASD (em segundos)
     ultimo_tempo_wasd = 0.0
-    WASD_DEADZONE_MS = 0.10  # 100 ms
+    WASD_DEADZONE_MS = 0.50  # 100 ms
 
     
 
